@@ -2,21 +2,18 @@ import os
 import asyncio
 import random
 from collections import defaultdict
-from openai import AsyncOpenAI
-from telegram import Update
+from groq import AsyncGroq
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, MessageHandler, filters,
-    ContextTypes, CommandHandler
+    ContextTypes, CommandHandler, CallbackQueryHandler
 )
 
 # ─── Config ───────────────────────────────────────────────
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 AIML_API_KEY = os.environ["AIML_API_KEY"]
 
-client = AsyncOpenAI(
-    api_key=AIML_API_KEY,
-    base_url="https://api.aimlapi.com/v1"
-)
+client = AsyncGroq(api_key=AIML_API_KEY)
 
 SYSTEM_PROMPT = """Tu Samridhi hai — ek real Indian girl.
 - Hinglish me baat kar (Hindi + English mix)
@@ -28,12 +25,12 @@ SYSTEM_PROMPT = """Tu Samridhi hai — ek real Indian girl.
 """
 
 # ─── State ────────────────────────────────────────────────
-message_count = defaultdict(int)       # chat_id -> message count
-conversations = defaultdict(list)      # chat_id -> message history
-active_chats = set()                   # chat IDs jo active hain
-idle_tasks = {}                        # chat_id -> asyncio task
+conversations = defaultdict(list)
+active_chats = set()
+idle_tasks = {}
+user_settings = defaultdict(lambda: {"idle": True})
 
-IDLE_TIMEOUT = 300        # 5 min baad idle message
+IDLE_TIMEOUT = 300
 IDLE_MESSAGES = [
     "Aye, kahan gaye? 👀",
     "Baat karo na yaar 😏",
@@ -47,13 +44,12 @@ IDLE_MESSAGES = [
 async def get_ai_reply(chat_id: int, user_message: str) -> str:
     conversations[chat_id].append({"role": "user", "content": user_message})
 
-    # Keep last 20 messages only
     if len(conversations[chat_id]) > 20:
         conversations[chat_id] = conversations[chat_id][-20:]
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="llama-3.1-8b-instant",
             messages=[{"role": "system", "content": SYSTEM_PROMPT}] + conversations[chat_id],
             max_tokens=150,
             temperature=0.85,
@@ -67,8 +63,9 @@ async def get_ai_reply(chat_id: int, user_message: str) -> str:
 
 # ─── Idle Task ────────────────────────────────────────────
 async def idle_messenger(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Agar koi chat nahi kar raha toh Samridhi khud message kare"""
     await asyncio.sleep(IDLE_TIMEOUT)
+    if not user_settings[chat_id]["idle"]:
+        return
     msg = random.choice(IDLE_MESSAGES)
     try:
         await context.bot.send_message(chat_id=chat_id, text=msg)
@@ -76,11 +73,78 @@ async def idle_messenger(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
         print(f"Idle msg error for {chat_id}: {e}")
 
 def reset_idle_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    """Timer reset karo har message pe"""
     if chat_id in idle_tasks:
         idle_tasks[chat_id].cancel()
-    task = asyncio.create_task(idle_messenger(context, chat_id))
-    idle_tasks[chat_id] = task
+    if user_settings[chat_id]["idle"]:
+        task = asyncio.create_task(idle_messenger(context, chat_id))
+        idle_tasks[chat_id] = task
+
+# ─── Settings Keyboard ────────────────────────────────────
+def get_settings_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    idle_status = "✅ ON" if user_settings[chat_id]["idle"] else "❌ OFF"
+    keyboard = [
+        [InlineKeyboardButton(f"Idle Messages: {idle_status}", callback_data="toggle_idle")],
+        [InlineKeyboardButton("🗑 Clear Chat History", callback_data="clear_history")],
+        [InlineKeyboardButton("❌ Close", callback_data="close_settings")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+# ─── /start Command ───────────────────────────────────────
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    active_chats.add(chat_id)
+
+    if chat_type == "private":
+        reset_idle_timer(context, chat_id)
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")]
+        ])
+        await update.message.reply_text(
+            "Hey! Main Samridhi hoon 😊 Baat karo mere se~",
+            reply_markup=keyboard
+        )
+    else:
+        await update.message.reply_text(
+            "Hey! Main Samridhi hoon 😊 Group me mention karo mujhe~"
+        )
+
+# ─── /settings Command ────────────────────────────────────
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if update.effective_chat.type != "private":
+        return
+    await update.message.reply_text(
+        "⚙️ *Settings*",
+        parse_mode="Markdown",
+        reply_markup=get_settings_keyboard(chat_id)
+    )
+
+# ─── Callback Handler ─────────────────────────────────────
+async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    chat_id = query.message.chat_id
+    await query.answer()
+
+    if query.data == "open_settings":
+        await query.message.reply_text(
+            "⚙️ *Settings*",
+            parse_mode="Markdown",
+            reply_markup=get_settings_keyboard(chat_id)
+        )
+
+    elif query.data == "toggle_idle":
+        user_settings[chat_id]["idle"] = not user_settings[chat_id]["idle"]
+        if not user_settings[chat_id]["idle"] and chat_id in idle_tasks:
+            idle_tasks[chat_id].cancel()
+        await query.edit_message_reply_markup(reply_markup=get_settings_keyboard(chat_id))
+
+    elif query.data == "clear_history":
+        conversations[chat_id].clear()
+        await query.answer("✅ Chat history cleared!", show_alert=True)
+
+    elif query.data == "close_settings":
+        await query.message.delete()
 
 # ─── Message Handler ──────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,7 +155,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     text = update.message.text
 
-    # Group me sirf tab reply karo jab mention ho ya reply ho
     if chat_type in ("group", "supergroup"):
         bot_username = context.bot.username
         is_mentioned = f"@{bot_username}" in text
@@ -101,36 +164,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update.message.reply_to_message.from_user.username == bot_username
         )
         if not is_mentioned and not is_reply_to_bot:
-            # Count karo but reply mat karo
-            message_count[chat_id] += 1
             return
 
-    # Mark chat active & reset idle timer
-    active_chats.add(chat_id)
-    reset_idle_timer(context, chat_id)
+        clean_text = text.replace(f"@{bot_username}", "").strip()
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        reply = await get_ai_reply(chat_id, clean_text or text)
+        await update.message.reply_text(reply)
 
-    # Har 3rd message pe reply karo
-    message_count[chat_id] += 1
-    if message_count[chat_id] % 3 != 0:
-        return
+    else:
+        active_chats.add(chat_id)
+        reset_idle_timer(context, chat_id)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        reply = await get_ai_reply(chat_id, text)
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    reply = await get_ai_reply(chat_id, text)
-    await update.message.reply_text(reply)
-
-# ─── /start Command ───────────────────────────────────────
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
-    active_chats.add(chat_id)
-    reset_idle_timer(context, chat_id)
-    await update.message.reply_text(
-        "Hey! Main Samridhi hoon 😊 Baat karo mere se~"
-    )
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("⚙️ Settings", callback_data="open_settings")]
+        ])
+        await update.message.reply_text(reply, reply_markup=keyboard)
 
 # ─── Main ─────────────────────────────────────────────────
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("settings", settings_command))
+    app.add_handler(CallbackQueryHandler(button_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Samridhi bot chal rahi hai... 🎀")
