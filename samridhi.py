@@ -132,17 +132,14 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown",
             reply_markup=get_settings_keyboard(chat_id)
         )
-
     elif query.data == "toggle_idle":
         user_settings[chat_id]["idle"] = not user_settings[chat_id]["idle"]
         if not user_settings[chat_id]["idle"] and chat_id in idle_tasks:
             idle_tasks[chat_id].cancel()
         await query.edit_message_reply_markup(reply_markup=get_settings_keyboard(chat_id))
-
     elif query.data == "clear_history":
         conversations[chat_id].clear()
         await query.answer("✅ Chat history cleared!", show_alert=True)
-
     elif query.data == "close_settings":
         await query.message.delete()
 
@@ -155,23 +152,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_type = update.effective_chat.type
     text = update.message.text
 
+    print(f"[MSG] chat_type={chat_type} chat_id={chat_id} text={text[:50]}")
+
     if chat_type in ("group", "supergroup"):
         bot_username = context.bot.username
-        is_mentioned = f"@{bot_username}" in text
+        print(f"[GROUP] bot_username={bot_username}")
+
+        # Check mention via entities (more reliable than string search)
+        is_mentioned = False
+        if update.message.entities:
+            for entity in update.message.entities:
+                if entity.type == "mention":
+                    mention_text = text[entity.offset: entity.offset + entity.length]
+                    print(f"[GROUP] mention found: {mention_text}")
+                    if mention_text.lower() == f"@{bot_username}".lower():
+                        is_mentioned = True
+                        break
+
         is_reply_to_bot = (
             update.message.reply_to_message and
             update.message.reply_to_message.from_user and
-            update.message.reply_to_message.from_user.username == bot_username
+            update.message.reply_to_message.from_user.username and
+            update.message.reply_to_message.from_user.username.lower() == bot_username.lower()
         )
+
+        print(f"[GROUP] is_mentioned={is_mentioned} is_reply_to_bot={is_reply_to_bot}")
+
         if not is_mentioned and not is_reply_to_bot:
             return
 
-        clean_text = text.replace(f"@{bot_username}", "").strip()
+        # Strip the bot mention from the text
+        clean_text = text.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "").strip()
+        if not clean_text:
+            clean_text = "Hello!"
+
+        print(f"[GROUP] Replying with clean_text={clean_text}")
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = await get_ai_reply(chat_id, clean_text or text)
+        reply = await get_ai_reply(chat_id, clean_text)
         await update.message.reply_text(reply)
 
     else:
+        # Private chat — reply to every message
         active_chats.add(chat_id)
         reset_idle_timer(context, chat_id)
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -191,7 +212,7 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Samridhi bot chal rahi hai... 🎀")
-    app.run_polling(drop_pending_updates=True)
+    app.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
